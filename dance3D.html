@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>3D去背景并跳动的角色 - 完整示例</title>
+  <style>
+    /* 整体页面布局和样式 */
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f0f0f0;
+      font-family: sans-serif;
+    }
+    /* 选择文件按钮、提示文案 */
+    #fileInput {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 9999;
+      font-size: 16px;
+      padding: 5px;
+    }
+    #tips {
+      position: absolute;
+      top: 50px;
+      left: 10px;
+      z-index: 9999;
+      width: 300px;
+      font-size: 14px;
+      color: #333;
+      background: rgba(255,255,255,0.8);
+      padding: 10px;
+      border-radius: 4px;
+      line-height: 1.4;
+    }
+    /* 加个小Loading提示 */
+    #loading {
+      position: absolute;
+      top: 100px;
+      left: 10px;
+      z-index: 9999;
+      font-size: 14px;
+      color: #555;
+      background: rgba(255,255,255,0.8);
+      padding: 8px;
+      border-radius: 4px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <!-- 文件上传按钮 -->
+  <input type="file" id="fileInput" accept="image/*">
+  <!-- 提示文案 -->
+  <div id="tips">
+    <strong>使用说明：</strong><br>
+    1. 点击「选择文件」上传一张人物/动物图片。<br>
+    2. 稍等片刻后，会自动去除背景，并把角色渲染到 3D 场景中。<br>
+    3. 角色会做简单的上下跳动示例。<br>
+    4. 若要重新上传图片，直接再次点击「选择文件」即可。<br>
+    <br>
+    <em>如果什么都没出现，往下看：</em><br>
+    · 试试换一张背景对比明显的照片<br>
+    · 或使用本地服务器打开此HTML（见下文说明）<br>
+  </div>
+  <!-- 载入时的一些提示 -->
+  <div id="loading">模型加载中，请稍候...</div>
+
+  <!-- 引入 TensorFlow.js 和 BodyPix（前景分割） -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix@2.2.0/dist/body-pix.min.js"></script>
+  <!-- 引入 Three.js（3D 场景渲染） -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.144.0/build/three.min.js"></script>
+
+  <script>
+    /*****************************************
+     *            常见问题（必读）            *
+     *****************************************
+     * Q: 为什么我双击这个HTML，打开后，上传完图片没有反应？
+     * A: 很多浏览器在直接用"file://本地路径"方式加载时，
+     *    会因为安全策略，阻止外部脚本或阻止读取本地图片等。
+     *    解决：用"本地服务器"方式打开，
+     *    例如：
+     *    1) 把本文件放到任意一个"VSCode"里，
+     *       安装"Live Server"插件，然后点击"Go Live"。
+     *    2) 如果装了Python，在此HTML所在的文件夹打开终端：
+     *       python -m http.server 8080
+     *       然后浏览器输入 http://localhost:8080/xxx.html
+     *    3) 或者上传到GitHub Pages、Netlify等平台
+     *    你完全不用懂代码，只需照做即可，能解决大部分问题。
+     *
+     * Q: 这段代码要联网吗？
+     * A: 是的，因为它从CDN加载TensorFlow.js、BodyPix、Three.js。
+     *    如果你想彻底离线，需要把这几个脚本下载到本地并改成本地引用。
+     *
+     * Q: 去背景不准，或者人物轮廓有残缺怎么办？
+     * A: 这是AI模型的自动识别效果，受图片清晰度、主体占比等影响。
+     *    多换几张图片试试，也可以调高模型设置中的分辨率或阈值。
+     *****************************************/
+
+    // ===== 全局变量 =====
+    let scene, camera, renderer;
+    let characterMesh = null;       // 用于存放抠好背景的网格
+    let bodyPixNet = null;          // BodyPix 模型
+    let loadingDiv = document.getElementById('loading');
+
+    // --- 1. 初始化 three.js 场景 ---
+    function initThreeJS() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        1,
+        1000
+      );
+      camera.position.set(0, 0, 5);
+      scene.add(camera);
+
+      renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      window.addEventListener('resize', onWindowResize, false);
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    // --- 2. 加载 BodyPix 模型 ---
+    async function loadBodyPixModel() {
+      loadingDiv.style.display = 'block';
+      bodyPixNet = await bodyPix.load({
+        architecture: 'MobileNetV1',
+        outputStride: 16,
+        multiplier: 0.75,
+        quantBytes: 2,
+      });
+      loadingDiv.style.display = 'none';
+      console.log('BodyPix 模型加载完毕');
+    }
+
+    // --- 3. 去背景 ---
+    async function removeBackground(image) {
+      // segmentPerson: 检测单个人的情况
+      const segmentation = await bodyPixNet.segmentPerson(image, {
+        internalResolution: 'medium', // 'low'/'medium'/'high'/'full'
+        segmentationThreshold: 0.7,
+      });
+
+      const { data: mask, width, height } = segmentation;
+
+      // 创建一个新的canvas，用来处理抠图
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+
+      // 画上原图
+      ctx.drawImage(image, 0, 0, width, height);
+
+      // 读取像素
+      const imageData = ctx.getImageData(0, 0, width, height);
+      const pixelData = imageData.data;
+
+      // 对非前景的像素设为透明
+      for (let i = 0; i < mask.length; i++) {
+        const isPerson = mask[i] === 1;
+        if (!isPerson) {
+          // 第i个像素的 alpha 设为0
+          pixelData[i * 4 + 3] = 0;
+        }
+      }
+      ctx.putImageData(imageData, 0, 0);
+
+      return canvas;
+    }
+
+    // --- 4. 在three.js中显示抠好的形象 ---
+    function setCharacterTexture(canvas) {
+      // 如果已经有角色网格了，先移除再重新创建
+      if (characterMesh) {
+        scene.remove(characterMesh);
+        characterMesh.geometry.dispose();
+        characterMesh.material.map.dispose();
+        characterMesh.material.dispose();
+      }
+
+      // 把canvas变成纹理贴图
+      const texture = new THREE.CanvasTexture(canvas);
+
+      // 根据图片宽高比，生成一个Plane
+      const aspect = canvas.width / canvas.height;
+      const planeHeight = 2.5;
+      const planeWidth = planeHeight * aspect;
+
+      const geometry = new THREE.PlaneGeometry(planeWidth, planeHeight);
+      const material = new THREE.MeshBasicMaterial({
+        map: texture,
+        transparent: true,
+        side: THREE.DoubleSide,
+      });
+
+      characterMesh = new THREE.Mesh(geometry, material);
+      scene.add(characterMesh);
+    }
+
+    // --- 5. 动画循环 ---
+    let clock = new THREE.Clock();
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // 让角色上下跳动
+      if (characterMesh) {
+        const t = clock.getElapsedTime();
+        characterMesh.position.y = Math.sin(t * 3) * 0.5;
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    // --- 6. 点击文件上传 ---
+    document.getElementById('fileInput').addEventListener('change', async function(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      loadingDiv.style.display = 'block';
+      const img = new Image();
+      img.onload = async () => {
+        // 抠图
+        const canvasResult = await removeBackground(img);
+        // 在3D中显示
+        setCharacterTexture(canvasResult);
+        loadingDiv.style.display = 'none';
+      };
+      // 用FileReader把本地图片读取为Base64
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        img.src = evt.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+
+    // --- 主入口 ---
+    (async function main() {
+      initThreeJS();
+      await loadBodyPixModel();
+      animate();
+    })();
+  </script>
+</body>
+</html>

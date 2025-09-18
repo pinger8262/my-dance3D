@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>视频布帘 · 原生无依赖版（高密+拖拽回落+风摆）</title>
+<style>
+  html,body{margin:0;height:100%;background:#fff;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,PingFang SC,Microsoft YaHei,sans-serif}
+  canvas{display:block}
+  .ui{
+    position:fixed;left:10px;top:10px;z-index:10;display:flex;gap:10px;flex-wrap:wrap;
+    background:rgba(0,0,0,.05);padding:6px 8px;border-radius:10px;border:1px solid rgba(0,0,0,.1);font-size:12px;color:#222
+  }
+  .ui button{padding:4px 8px;border-radius:8px;border:1px solid #bbb;background:#111;color:#fff;cursor:pointer}
+  .hud{
+    position:fixed;left:10px;bottom:10px;z-index:10;font-size:12px;color:#333;
+    background:rgba(0,0,0,.06);padding:6px 8px;border-radius:8px;border:1px solid rgba(0,0,0,.1);white-space:pre-line
+  }
+</style>
+</head>
+<body>
+  <div class="ui">
+    <label>选择视频 <input id="file" type="file" accept="video/*" /></label>
+    <button id="start">开始</button>
+    <label><input id="preview" type="checkbox" /> 预览原视频</label>
+  </div>
+  <canvas id="cv"></canvas>
+  <div class="hud" id="hud">未选择视频</div>
+
+<script>
+/* ======= 简易工具 ======= */
+function lerp(a,b,t){ return a + (b-a)*t; }
+
+/* ======= 帘子尺寸 & 密度（更宽更密，连成布面） ======= */
+const CURTAIN_WIDTH_FRAC  = 0.82;   // 帘子宽度占画布比例
+const CURTAIN_TOP_FRAC    = 0.14;   // 顶沿离顶部比例
+const CURTAIN_HEIGHT_FRAC = 0.58;   // 帘子高度比例
+
+let STRIPS = 110;   // 竖条数量（100~130 更像“整块布”）
+let NODES  = 28;    // 每条节点数（竖向段数）
+
+/* ======= 物理手感（竖条链） ======= */
+const PIN_TOP     = true;     // 顶部节点固定
+const GRAVITY     = 1500;     // 下落更顺滑
+const DAMPING     = 0.994;    // 阻尼（越接近1越丝滑）
+const ITER        = 12;       // 约束迭代（更稳定）
+const SPRING_STIFF= 0.88;     // 相邻段“长度约束”强度
+const BEND_STIFF  = 0.40;     // 隔一段“弯曲平滑”强度
+const HOME_KX     = 0.016;    // 横向回位（仅拉 x 回正，避免硬顶）
+
+/* ======= 风（轻摆） ======= */
+let windOn = true;
+const WIND_AMPL = 70;         // 厚一点的布 → 风振幅稍小
+const WIND_FREQ_T = 0.55;
+const WIND_FREQ_Y = 0.015;
+const WIND_BOTTOM_GAIN = 1.25;
+
+/* ======= 画布 / 缓冲 / 视频 ======= */
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d', {alpha:false, desynchronized:true});
+const hud = document.getElementById('hud');
+
+let W=0,H=0,leftX,topY,clothW,clothH,dx,dy,restY;
+
+const buf  = document.createElement('canvas');
+const bctx = buf.getContext('2d', {alpha:false});
+let BW=0,BH=0;
+function updateBufSize(){
+  BW = Math.max(360, Math.floor(window.innerWidth * 0.7));
+  BH = Math.max(200, Math.floor(window.innerHeight* 0.6));
+  buf.width = BW; buf.height = BH;
+}
+let coverRect={sx:0,sy:0,sw:1,sh:1};
+
+const video = document.createElement('video');
+video.muted = true; video.loop = true; video.playsInline = true; video.autoplay = false;
+
+/* ======= UI ======= */
+const elFile = document.getElementById('file');
+const elStart= document.getElementById('start');
+const elPrev = document.getElementById('preview');
+
+elFile.addEventListener('change', e=>{
+  const f=e.target.files?.[0]; if(!f){ hud.textContent='未选择视频'; return; }
+  video.src = URL.createObjectURL(f);
+  hud.textContent = '已选择：' + (f.name||'');
+});
+elStart.addEventListener('click', ()=>{
+  video.play().then(()=>{ hud.textContent = '播放中…'; })
+              .catch(err=>{ hud.textContent = '播放被阻止：再点一次“开始”'; console.error(err); });
+});
+video.addEventListener('loadedmetadata', ()=>{
+  updateCoverRect();
+});
+video.addEventListener('play', ()=>{ hud.textContent='播放中…'; });
+video.addEventListener('pause',()=>{ hud.textContent='已暂停'; });
+
+function updateCoverRect(){
+  const vw=video.videoWidth||16, vh=video.videoHeight||9;
+  const tW=BW||16, tH=BH||9;
+  const vA=vw/vh, tA=tW/tH;
+  if(vA>tA){ coverRect={sx:(vw-vh*tA)/2,sy:0,sw:vh*tA,sh:vh}; }
+  else     { coverRect={sx:0,sy:(vh-vw/tA)/2,sw:vw,sh:vw/tA}; }
+}
+
+/* ======= 竖条节点（原生 Verlet） ======= */
+class Node{
+  constructor(x,y,phase=0){
+    this.x=x; this.y=y;
+    this.lx=x; this.ly=y;       // last
+    this.ax=0; this.ay=0;       // acc
+    this.hx=x; this.hy=y;       // home
+    this.pinned=false;
+    this.phase=phase;           // 风的相位
+  }
+  applyForce(fx,fy){ this.ax+=fx; this.ay+=fy; }
+  update(dt){
+    if(this.pinned){
+      this.x=this.hx; this.y=this.hy;
+      this.lx=this.x; this.ly=this.y;
+      this.ax=0; this.ay=0; return;
+    }
+    // 仅横向回位（保持布“回正”但不硬顶）
+    this.ax += (this.hx - this.x) * HOME_KX;
+
+    const vx=(this.x - this.lx)*DAMPING;
+    const vy=(this.y - this.ly)*DAMPING;
+    this.lx = this.x; this.ly = this.y;
+    this.x += vx + this.ax*dt*dt;
+    this.y += vy + this.ay*dt*dt;
+    this.ax = 0; this.ay = 0;
+  }
+}
+
+let nodes=[]; // nodes[s][i]
+function buildCurtain(){
+  nodes=[];
+  clothW = W * CURTAIN_WIDTH_FRAC;
+  clothH = H * CURTAIN_HEIGHT_FRAC;
+  leftX  = (W - clothW)/2;
+  topY   = H * CURTAIN_TOP_FRAC;
+  dx = clothW/(STRIPS-1);
+  dy = clothH/(NODES-1);
+  restY = dy;
+
+  for(let s=0;s<STRIPS;s++){
+    nodes[s]=[];
+    const phase = s*0.35;
+    for(let i=0;i<NODES;i++){
+      const n = new Node(leftX + s*dx, topY + i*dy, phase);
+      if(PIN_TOP && i===0) n.pinned=true;
+      nodes[s][i]=n;
+    }
+  }
+}
+
+/* ======= 约束（竖向长度 + 弯曲） ======= */
+function solveConstraints(){
+  for(let it=0; it<ITER; it++){
+    for(let s=0;s<STRIPS;s++){
+      const strip=nodes[s];
+      // 相邻长度保持
+      for(let i=1;i<NODES;i++){
+        const a=strip[i-1], b=strip[i];
+        let vx=b.x-a.x, vy=b.y-a.y;
+        let d=Math.hypot(vx,vy); if(d===0) continue;
+        const diff=(restY - d)/d * SPRING_STIFF;
+        const cx=vx*diff, cy=vy*diff;
+        if(!a.pinned){ a.x -= cx*0.5; a.y -= cy*0.5; }
+        if(!b.pinned){ b.x += cx*0.5; b.y += cy*0.5; }
+      }
+      // 隔一段的弯曲平滑
+      for(let i=2;i<NODES;i++){
+        const a=strip[i-2], c=strip[i];
+        let vx=c.x-a.x, vy=c.y-a.y;
+        let d=Math.hypot(vx,vy); if(d===0) continue;
+        const rest2=restY*2;
+        const diff=(rest2 - d)/d * BEND_STIFF;
+        const cx=vx*diff, cy=vy*diff;
+        if(!a.pinned){ a.x -= cx*0.5; a.y -= cy*0.5; }
+        if(!c.pinned){ c.x += cx*0.5; c.y += cy*0.5; }
+      }
+    }
+  }
+}
+
+/* ======= 外力：重力 + 风 ======= */
+function applyForces(t){
+  for(let s=0;s<STRIPS;s++){
+    for(let i=0;i<NODES;i++){
+      const n=nodes[s][i]; if(n.pinned) continue;
+      // 重力
+      n.applyForce(0, GRAVITY);
+      // 风（横向）
+      if(windOn){
+        const ty = i/(NODES-1);
+        const gain = (1-0.2) + (WIND_BOTTOM_GAIN-1)*(ty); // 线性放大
+        const phase = n.phase + t*WIND_FREQ_T + (n.y-topY)*WIND_FREQ_Y;
+        const fx = Math.sin(phase) * WIND_AMPL * gain;
+        n.applyForce(fx, 0);
+      }
+    }
+  }
+}
+
+/* ======= 交互：大半径 + 速度注入（好拉、松手回） ======= */
+let dragging=false,lastMX=0,lastMY=0;
+function mouseDown(ev){ dragging=true; lastMX=ev.clientX; lastMY=ev.clientY; }
+function mouseUp(){ dragging=false; }
+function mouseMove(ev){
+  if(!dragging) return;
+  const mx=ev.clientX, my=ev.clientY;
+  const vx = mx - lastMX, vy = my - lastMY;
+  const rad = dx*2.0, rad2=rad*rad;
+  for(let s=0;s<STRIPS;s++){
+    for(let i=0;i<NODES;i++){
+      const n=nodes[s][i]; if(n.pinned) continue;
+      if(n.x < leftX-40 || n.x > leftX+clothW+40) continue;
+      if(n.y < topY-40  || n.y > topY+clothH+40)   continue;
+      const dxp=n.x-mx, dyp=n.y-my; const d2=dxp*dxp+dyp*dyp;
+      if(d2<rad2){
+        n.x += vx;
+        n.y += vy*0.5;
+        const boost=1.25;      // 强一点的“速度注入”
+        n.lx = n.x - vx*boost;
+        n.ly = n.y - vy*boost*0.5;
+      }
+    }
+  }
+  lastMX=mx; lastMY=my;
+}
+window.addEventListener('mousedown', mouseDown);
+window.addEventListener('mousemove', mouseMove);
+window.addEventListener('mouseup',   mouseUp);
+window.addEventListener('touchstart', e=>{ if(e.touches.length){ dragging=true; lastMX=e.touches[0].clientX; lastMY=e.touches[0].clientY; } }, {passive:false});
+window.addEventListener('touchmove',  e=>{ if(!dragging||!e.touches.length) return; const t=e.touches[0]; mouseMove({clientX:t.clientX, clientY:t.clientY}); e.preventDefault(); }, {passive:false});
+window.addEventListener('touchend',   ()=>{ dragging=false; });
+
+/* ======= 计算某条在 y 处的 x（用于视频切片映射） ======= */
+function xAtY(s, y){
+  const strip=nodes[s];
+  if(y<=strip[0].y) return strip[0].x;
+  if(y>=strip[NODES-1].y) return strip[NODES-1].x;
+  // 用均匀步长猜测一个段位，再微调
+  let i = Math.max(0, Math.min(NODES-2, Math.floor((y - topY)/dy)));
+  while(i<NODES-2 && y>strip[i+1].y) i++;
+  while(i>0        && y<strip[i].y)   i--;
+  const y0=strip[i].y, y1=strip[i+1].y;
+  const t = (y1===y0)? 0 : (y - y0)/(y1 - y0);
+  return lerp(strip[i].x, strip[i+1].x, t);
+}
+
+/* ======= 帧循环（带容错 HUD） ======= */
+let WSLICE = 4; // 视频切片的垂向步长（越小越细腻）
+function resize(){
+  W = cv.width  = window.innerWidth;
+  H = cv.height = window.innerHeight;
+  updateBufSize();
+  buildCurtain();
+  updateCoverRect();
+}
+window.addEventListener('resize', resize, {passive:true}); resize();
+
+function loop(ts){
+  try{
+    const dt = 1/60, t = performance.now()/1000;
+
+    // 将视频绘制到低分缓冲（无视频时填充灰）
+    if(video.readyState >= 2){
+      const {sx,sy,sw,sh} = coverRect;
+      bctx.drawImage(video, sx,sy,sw,sh, 0,0, BW,BH);
+    }else{
+      bctx.fillStyle = '#e6e6e6';
+      bctx.fillRect(0,0,BW,BH);
+    }
+
+    // 物理：外力→积分→约束
+    applyForces(t);
+    for(let s=0;s<STRIPS;s++) for(let i=0;i<NODES;i++) nodes[s][i].update(dt);
+    solveConstraints();
+
+    // 背景
+    ctx.fillStyle='#fff'; ctx.fillRect(0,0,W,H);
+
+    if(elPrev.checked){
+      // 预览原视频（调试用）
+      ctx.drawImage(buf, 0,0,BW,BH, 0,0,W,H);
+    }else{
+      // —— 视频贴到“竖条帘子”上（逐条逐小段切片）——
+      const srcWPer = BW/STRIPS;
+      for(let s=0; s<STRIPS-1; s++){
+        for(let y=topY; y<topY+clothH; y+=WSLICE){
+          const xL = xAtY(s,   y);
+          const xR = xAtY(s+1, y);
+          const w  = xR - xL;
+          const syPix = ((y - topY)/clothH) * BH;
+          const shPix = (Math.min(WSLICE, topY+clothH - y)/clothH) * BH;
+          ctx.drawImage(buf,
+            s*srcWPer, syPix, srcWPer, shPix,
+            xL, y, w, Math.min(WSLICE, topY+clothH-y)
+          );
+        }
+      }
+      // 轮廓线（想更“像布”可注释掉这段）
+      ctx.strokeStyle='#000'; ctx.lineWidth=1.1;
+      for(let s=0;s<STRIPS;s++){
+        for(let i=1;i<NODES;i++){
+          const a=nodes[s][i-1], b=nodes[s][i];
+          ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+        }
+      }
+      // 顶部横梁
+      ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(leftX, topY); ctx.lineTo(leftX+clothW, topY); ctx.stroke();
+    }
+
+    // HUD
+    hud.textContent =
+      (elFile.files?.[0] ? ('文件: '+(elFile.files[0].name||'')+'\n') : '未选择视频\n') +
+      `video readyState: ${video.readyState}  paused: ${video.paused}  t=${(video.currentTime||0).toFixed(2)}s\n` +
+      (elPrev.checked ? '模式: 预览原视频' : '模式: 帘子贴图') + ` | 条数:${STRIPS} 节点:${NODES}`;
+  }catch(err){
+    hud.textContent = '错误：' + err.message;
+    console.error(err);
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// 禁右键菜单（避免误触）
+window.addEventListener('contextmenu', e=>e.preventDefault());
+</script>
+</body>
+</html>

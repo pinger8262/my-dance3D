@@ -64,6 +64,8 @@ let W=0,H=0,leftX,topY,clothW,clothH,dx,dy,restY;
 
 const buf  = document.createElement('canvas');
 const bctx = buf.getContext('2d', {alpha:false});
+const lineLayer = document.createElement('canvas');
+const lctx = lineLayer.getContext('2d', {alpha:true});
 let BW=0,BH=0;
 function updateBufSize(){
   BW = Math.max(360, Math.floor(window.innerWidth * 0.7));
@@ -236,25 +238,12 @@ window.addEventListener('touchstart', e=>{ if(e.touches.length){ dragging=true; 
 window.addEventListener('touchmove',  e=>{ if(!dragging||!e.touches.length) return; const t=e.touches[0]; mouseMove({clientX:t.clientX, clientY:t.clientY}); e.preventDefault(); }, {passive:false});
 window.addEventListener('touchend',   ()=>{ dragging=false; });
 
-/* ======= 计算某条在 y 处的 x（用于视频切片映射） ======= */
-function xAtY(s, y){
-  const strip=nodes[s];
-  if(y<=strip[0].y) return strip[0].x;
-  if(y>=strip[NODES-1].y) return strip[NODES-1].x;
-  // 用均匀步长猜测一个段位，再微调
-  let i = Math.max(0, Math.min(NODES-2, Math.floor((y - topY)/dy)));
-  while(i<NODES-2 && y>strip[i+1].y) i++;
-  while(i>0        && y<strip[i].y)   i--;
-  const y0=strip[i].y, y1=strip[i+1].y;
-  const t = (y1===y0)? 0 : (y - y0)/(y1 - y0);
-  return lerp(strip[i].x, strip[i+1].x, t);
-}
-
 /* ======= 帧循环（带容错 HUD） ======= */
-let WSLICE = 4; // 视频切片的垂向步长（越小越细腻）
 function resize(){
   W = cv.width  = window.innerWidth;
   H = cv.height = window.innerHeight;
+  lineLayer.width = W;
+  lineLayer.height = H;
   updateBufSize();
   buildCurtain();
   updateCoverRect();
@@ -286,31 +275,40 @@ function loop(ts){
       // 预览原视频（调试用）
       ctx.drawImage(buf, 0,0,BW,BH, 0,0,W,H);
     }else{
-      // —— 视频贴到“竖条帘子”上（逐条逐小段切片）——
-      const srcWPer = BW/STRIPS;
-      for(let s=0; s<STRIPS-1; s++){
-        for(let y=topY; y<topY+clothH; y+=WSLICE){
-          const xL = xAtY(s,   y);
-          const xR = xAtY(s+1, y);
-          const w  = xR - xL;
-          const syPix = ((y - topY)/clothH) * BH;
-          const shPix = (Math.min(WSLICE, topY+clothH - y)/clothH) * BH;
-          ctx.drawImage(buf,
-            s*srcWPer, syPix, srcWPer, shPix,
-            xL, y, w, Math.min(WSLICE, topY+clothH-y)
-          );
+      // —— 视频纹理贴到“线条”上 ——
+      const lineWidth = Math.max(4, dx*0.55);
+      lctx.clearRect(0,0,W,H);
+      lctx.drawImage(buf, 0,0,BW,BH, leftX, topY, clothW, clothH);
+      lctx.globalCompositeOperation='destination-in';
+      lctx.lineWidth = lineWidth;
+      lctx.lineCap = 'round';
+      lctx.lineJoin = 'round';
+      lctx.beginPath();
+      for(let s=0;s<STRIPS;s++){
+        const strip=nodes[s];
+        lctx.moveTo(strip[0].x, strip[0].y);
+        for(let i=1;i<NODES;i++){
+          lctx.lineTo(strip[i].x, strip[i].y);
         }
       }
-      // 轮廓线（想更“像布”可注释掉这段）
-      ctx.strokeStyle='#000'; ctx.lineWidth=1.1;
+      lctx.stroke();
+      lctx.globalCompositeOperation='source-over';
+      ctx.drawImage(lineLayer, 0,0);
+      // 轻微描边让线条更立体
+      ctx.strokeStyle='rgba(0,0,0,0.18)';
+      ctx.lineWidth = Math.max(1.5, lineWidth*0.25);
+      ctx.lineCap='round';
       for(let s=0;s<STRIPS;s++){
-        for(let i=1;i<NODES;i++){
-          const a=nodes[s][i-1], b=nodes[s][i];
-          ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
-        }
+        const strip=nodes[s];
+        ctx.beginPath();
+        ctx.moveTo(strip[0].x, strip[0].y);
+        for(let i=1;i<NODES;i++) ctx.lineTo(strip[i].x, strip[i].y);
+        ctx.stroke();
       }
       // 顶部横梁
-      ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(leftX, topY); ctx.lineTo(leftX+clothW, topY); ctx.stroke();
+      ctx.lineWidth=Math.max(4.5, lineWidth*0.9);
+      ctx.strokeStyle='rgba(0,0,0,0.65)';
+      ctx.beginPath(); ctx.moveTo(leftX, topY); ctx.lineTo(leftX+clothW, topY); ctx.stroke();
     }
 
     // HUD
